@@ -1,0 +1,267 @@
+# Copyright 2020-2023 Free Software Foundation, Inc.
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# NOTICE:
+# QEMU user mode gdbstub has multithreading problems
+# https://gitlab.com/qemu-project/qemu/-/issues/1671
+# run with --ignore gdb.threads/access-mem-running-thread-exit.exp
+# since this test in particular seems to hang. Could be related.
+
+# This technique is from native-extended-gdbserver.exp
+# We must load this explicitly here, and rename the procedures we want
+# to override.  If we didn't do this, given that mi-support.exp is
+# loaded later in the test files, the procedures loaded then would
+# override our definitions.
+load_lib mi-support.exp
+
+set qemu ""
+set qemu_arch ""
+set qemu_user_spawn_id ""
+set qemu_user_last_load_file ""
+set port "2345"
+
+# add sections for other architectures
+# as needed
+case "$target_triplet" in {
+	{ "mips" } {
+		set qemu "qemu-mips"
+		set qemu_arch "mips"
+	}
+	default {
+		puts "No target hardware for $target_triplet"
+	}
+}
+
+# QEMU supports some of extended-remote, but not the run command
+# which causes problems for the test suite
+set_board_info gdb_protocol "remote"
+set_board_info use_gdb_stub 1
+set_board_info gdb,do_reload_on_run 1
+set_board_info exit_is_reliable 1
+# static link so we do not need to configure an QEMU LD prefix and install
+# libraries for the target architecture
+set_board_info ldflags "-static"
+
+# technique from simavr.exp
+#
+# Load executable into GDB
+#
+proc gdb_load { arg } {
+    global gdb_prompt
+    global verbose
+    global spawn_id
+    global qemu
+    global qemu_user_last_load_file
+    global qemu_user_spawn_id
+    global port
+
+    # keep track of last loaded file
+    # to simulate run restart like behavior
+    if { $arg == "" } {
+		set arg $qemu_user_last_load_file
+		if { $arg == ""  } {
+			global last_loaded_file
+			# this fallback is needed
+			# for tests like gdb.base/break-unload-file.exp
+			set arg $last_loaded_file
+		}
+    } else {
+       set qemu_user_last_load_file $arg
+    }
+
+    if { $arg != "" } {
+		if {[gdb_file_cmd $arg]} then { return -1 }
+    }
+
+    # Close any previous qemu user instance.
+    if { $qemu_user_spawn_id != "" } {
+		verbose -log "qemu user: closing previous spawn id $qemu_user_spawn_id"
+		if [catch { close -i $qemu_user_spawn_id } != 0] {
+			warning "qemu user: failed to close connection to previous qemu user instance"
+		}
+
+		# some tests get QEMU
+		# into a state where the process doesn't want to die
+		# so -nowait to not hang the entire test run
+		wait -nowait -i $qemu_user_spawn_id
+		set qemu_user_spawn_id ""
+    }
+
+    # technique from gdbserver-support.exp
+    # Loop till we find a free port.
+    # This is to cope with qemu sometimes getting
+    # into a bad state and not closing.
+    # Do a pkill -f qemu-mips -9 after running tests
+    # to remove stragglers
+    while 1 {
+		# Run QEMU user
+		set cmd "spawn -noecho $qemu -g $port $arg"
+		verbose -log "Spawning qemu user: $cmd"
+		eval $cmd
+		set qemu_user_spawn_id $spawn_id
+
+		# without inferior_spawn_id
+		# tests such as gdb.base/a2-run.exp
+		# can't look at the right process output
+		global inferior_spawn_id
+		set inferior_spawn_id $spawn_id
+
+		expect {
+			-i $qemu_user_spawn_id
+			-timeout 1
+			-re ".*qemu: could not open gdbserver on.*" {
+				verbose -log "Port $port is already in use."
+				if [catch { close -i $qemu_user_spawn_id } != 0] {
+					warning "qemu user: failed to close connection to previous qemu user instance"
+				}
+				# Bump the port number to avoid the conflict.
+				wait -i $qemu_user_spawn_id
+				incr port
+				continue
+			}
+		}
+		break
+	}
+
+    # arch needs set because some tests
+    # take actions that need arch to be correct
+    # immediately, before file command loads the binary
+    # for example gdb.base/break-unload-file.exp
+    global qemu_arch
+    send_gdb "set arch $qemu_arch\n"
+
+    # Connect to qemu user.
+    send_gdb "target remote :$port\n"
+    gdb_expect {
+		# qemu user mode gdb stub does not support non stop mode
+		# this is so tests that attempt it die quickly
+		-re ".*Non-stop mode requested, but remote does not support non-stop.*" {
+			error "qemu user does not support non-stop"
+		}
+		# cannot have multiple targets connected
+		# some tests end up causing this to be attempted in gdb.multi
+		-re ".*Already connected to a remote target.  Disconnect?.*" {
+			send_gdb "y\n"
+			gdb_expect {
+				-re ".*$gdb_prompt $" {
+					error "connected to new target while connected to existing"
+				}
+			}
+		}
+		-re ".*$gdb_prompt $" {
+			if $verbose>1 then {
+				send_user "Connected to QEMU target\n"
+			}
+		}
+		-re "Remote debugging using .*$gdb_prompt $" {
+			verbose "Set target to remote for QEMU"
+		}
+		timeout {
+			verbose -log "qemu-user: unable to connect to qemu user, closing qemu user spawn id"
+			close -i $qemu_user_spawn_id
+			verbose -log "qemu-user: unable to connect to qemu user, waiting for qemu user process exit"
+			wait -i $qemu_user_spawn_id
+			set qemu_user_spawn_id ""
+			error "unable to connect to qemu user stub"
+		}
+	}
+
+	return 0
+}
+
+# technique from native-extended-gdbserver.exp
+# for overriding mi-support.exp procs
+if { [info procs original_mi_gdb_load] == "" } {
+    rename mi_gdb_load original_gdbserver_mi_gdb_load
+}
+
+# same ideas as gdb_load, but adapted for mi
+proc mi_gdb_load { arg } {
+    global gdb_prompt
+    global verbose
+    global spawn_id
+    global qemu
+    global qemu_user_last_load_file
+    global qemu_user_spawn_id
+    global port
+
+    if { $arg == "" } {
+		set arg $qemu_user_last_load_file
+		if { $arg == ""  } {
+			global last_loaded_file
+			set arg $last_loaded_file
+		}
+    } else {
+		set qemu_user_last_load_file $arg
+    }
+
+    if { $arg != "" } {
+		if {[mi_gdb_file_cmd $arg]} then { return -1 }
+    }
+
+    #Close any previous qemu user instance.
+    if { $qemu_user_spawn_id != "" } {
+		verbose -log "qemu user: closing previous spawn id $qemu_user_spawn_id"
+		if [catch { close -i $qemu_user_spawn_id } != 0] {
+			warning "qemu user: failed to close previous qemu user instance"
+		}
+
+		# some tests get QEMU/its gdb stub
+		# into a state where the process doesn't want to die
+		# so -nowait to not hang the entire test run
+		wait -nowait -i $qemu_user_spawn_id
+		set qemu_user_spawn_id ""
+    }
+
+    # technique from gdbserver-support.exp
+    # Loop till we find a free port.
+    while 1 {
+		# Run QEMU user
+		set cmd "spawn -noecho $qemu -g $port $arg"
+		verbose -log "Spawning qemu user: $cmd"
+		eval $cmd
+		set qemu_user_spawn_id $spawn_id
+
+		# without inferior_spawn_id
+		# tests such as gdb.base/a2-run.exp
+		# can't look at the right process output
+		global inferior_spawn_id
+		set inferior_spawn_id $spawn_id
+
+		expect {
+			-i $qemu_user_spawn_id
+			-timeout 1
+			-re ".*qemu: could not open gdbserver on.*" {
+				verbose -log "Port $port is already in use."
+				if [catch { close -i $qemu_user_spawn_id } != 0] {
+					warning "qemu user: failed to close connection to previous qemu user instance"
+				}
+				# Bump the port number to avoid the conflict.
+				wait -i $qemu_user_spawn_id
+				incr port
+				continue
+			}
+		}
+		break
+	}
+
+	return 0
+}
+
+# technique from stdio-gdb-server-base.exp
+proc mi_gdb_target_load { } {
+    global port
+    return [mi_gdb_target_cmd "remote" ":$port"]
+}

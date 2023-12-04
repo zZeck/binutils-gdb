@@ -1,0 +1,67 @@
+These tests are adapted for dealing with the limitations of old compilers and the mdebug format.
+
+Execute the mdebug tests with something like:
+runtest gdb.mdebug/info-types-c.exp CC_FOR_TARGET=idowrapper MDEBUG=1 --target mips --target_board qemu-user
+
+The CC_FOR_TARGET is probably going to be a wrapper script
+for an old compiler running in an emulator.
+Example at the end of this readme.
+Put it somewhere in your PATH.
+Do not give the path to the script as CC_FOR_TARGET, that does not work.
+
+The qemu-user board will run mips programs in qemu user mode
+and connect gdb to QEMU's gdb stub.
+
+mdebug does not record line numbers for type definitions.
+This is why the info types tests are modified
+
+mdebug output can be odd in how line mappings deal with the start of functions.
+This is why the break tests are modified.
+
+Most compilers outputting mdebug data are so old they cannot deal with C99 features.
+This makes parsing standard library headers for modern implementations a problem.
+Also, even past that, the headers may eventually lead to compiler specific code
+in things like stddef.h that may not be appriopriate for your old compiler.
+This is why break.c has some modified standard function signatures at the beginning.
+
+A few of the break tests *sometimes* fail still.
+Several memory initialization bugs were fixed but whatever is causing that
+is very inconsistent. Or it could be some issue with the exp file.
+
+The best documentation on mdebug are these documents:
+
+"Tru64 UNIX Object File and Symbol Table Format Specification"
+Sections 5, 9, and 10
+Note, the word "mdebug" is never used, but it is that format
+carried through from DEC to Compaq.
+
+"MIPS Mdebug Debugging Information" by David Anderson
+
+A wrapper script like this was used to create .o files with IDO running in an emulator.
+The final link commands are run with regular linux gcc.
+
+#!/bin/sh
+
+echo "$@" >> theargs
+
+for arg do
+  if [ "$arg" = "-static" ]
+  then
+    link=1
+  fi
+done
+
+if [ "$link" = 1 ]
+then
+  mips-unknown-linux-gnu-gcc "$@" -fno-exceptions
+else
+for arg do
+  shift
+  [ "$arg" = "-fdiagnostics-color=never" ] && continue
+  [ "$arg" = "-g" ] && continue
+  set -- "$@" "$arg"
+done
+
+/home/someuser/qemu-irix/build/irix-linux-user/qemu-irix -L /home/someuser/ido/ido7.1_compiler /home/someuser/ido/ido7.1_compiler/usr/bin/cc -Xcpluscomm -nostdlib -nostdinc -mips2
+-g2 "$@" 2>/dev/null
+fi

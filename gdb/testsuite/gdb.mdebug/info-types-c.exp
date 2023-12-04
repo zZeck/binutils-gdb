@@ -1,0 +1,67 @@
+# Copyright 2019-2023 Free Software Foundation, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+require {info exists MDEBUG}
+
+global testfile
+global srcfile
+global binfile
+global subdir
+global srcdir
+global compile_flags
+
+standard_testfile info-types.c
+
+if {[prepare_for_testing "failed to prepare" \
+     "${testfile}" $srcfile "debug c"]} {
+return -1
+}
+
+gdb_test_no_output "set auto-solib-add off"
+
+if ![runto_main] then {
+return 0
+}
+
+set file_re "File .*[string_to_regexp $srcfile]:"\
+
+set output_lines \
+    [list \
+	 "^All defined types:" \
+	 ".*" \
+	 $file_re \
+	 "\[\t \]+typedef enum {\\.\\.\\.} anon_enum_t;" \
+	 "\[\t \]+typedef struct {\\.\\.\\.} anon_struct_t;" \
+	 "\[\t \]+typedef union {\\.\\.\\.} anon_union_t;" \
+	 "\[\t \]+typedef struct baz_t baz;" \
+	 "\[\t \]+typedef struct baz_t \\* baz_ptr;" \
+	 "\[\t \]+typedef struct baz_t baz_t;" \
+	 "\[\t \]+enum enum_t;" \
+	 "\[\t \]+typedef enum enum_t my_enum_t;" \
+	 "\[\t \]+typedef float my_float_t;" \
+	 "\[\t \]+typedef int my_int_t;" \
+	 "\[\t \]+typedef enum {\\.\\.\\.} nested_anon_enum_t;" \
+	 "\[\t \]+typedef struct {\\.\\.\\.} nested_anon_struct_t;" \
+	 "\[\t \]+typedef union {\\.\\.\\.} nested_anon_union_t;" \
+	 "\[\t \]+typedef struct baz_t nested_baz;" \
+	 "\[\t \]+typedef struct baz_t nested_baz_t;" \
+	 "\[\t \]+typedef enum enum_t nested_enum_t;" \
+	 "\[\t \]+typedef float nested_float_t;" \
+	 "\[\t \]+typedef int nested_int_t;" \
+	 "\[\t \]+typedef union union_t nested_union_t;" \
+	 "\[\t \]+union union_t;" \
+	 "($|\r\n.*)"]
+
+gdb_test_lines "info types" "" [multi_line {*}$output_lines]

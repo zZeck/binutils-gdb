@@ -237,7 +237,7 @@ static struct type *new_type (char *);
 enum block_type { FUNCTION_BLOCK, NON_FUNCTION_BLOCK };
 
 static struct block *new_block (struct objfile *objfile,
-				enum block_type, enum language);
+				enum block_type, enum language, bool is_global);
 
 static struct compunit_symtab *new_symtab (const char *, int, struct objfile *);
 
@@ -246,7 +246,7 @@ static struct linetable *new_linetable (int);
 static struct blockvector *new_bvect (int);
 
 static struct type *parse_type (int, union aux_ext *, unsigned int, int *,
-				int, const char *);
+				int, const char *, bool);
 
 static struct symbol *mylookup_symbol (const char *, const struct block *,
 				       domain_enum, enum address_class);
@@ -572,7 +572,7 @@ add_data_symbol (SYMR *sh, union aux_ext *ax, int bigend,
       || sh->sc == scNil || sh->index == indexNil)
     s->set_type (builtin_type (objfile)->nodebug_data_symbol);
   else
-    s->set_type (parse_type (cur_fd, ax, sh->index, 0, bigend, name));
+    s->set_type (parse_type (cur_fd, ax, sh->index, 0, bigend, name, false));
   /* Value of a data symbol is its memory address.  */
 }
 
@@ -624,8 +624,17 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
       break;
     }
 
-  if (section_index != -1)
-    sh->value += section_offsets[section_index];
+  if (section_index != -1) {
+	int offset = section_offsets[section_index];
+    if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+    {
+	  /* This is attempting to detect .o files.
+	     Their sections are relocated in symfile.c default_symfile_offsets
+	     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+	  offset += objfile->sections_start[section_index].the_bfd_section->vma;
+    }
+	sh->value += offset;
+  }
 
   switch (sh->st)
     {
@@ -705,7 +714,7 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
 	  break;
 	}
       s->set_value_longest (svalue);
-      s->set_type (parse_type (cur_fd, ax, sh->index, 0, bigend, name));
+      s->set_type (parse_type (cur_fd, ax, sh->index, 0, bigend, name, false));
       add_symbol (s, top_stack->cur_st, top_stack->cur_block);
       break;
 
@@ -761,7 +770,7 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
 	t = builtin_type (objfile)->builtin_int;
       else
 	{
-	  t = parse_type (cur_fd, ax, sh->index + 1, 0, bigend, name);
+	  t = parse_type (cur_fd, ax, sh->index + 1, 0, bigend, name, false);
 	  if (strcmp (name, "malloc") == 0
 	      && t->code () == TYPE_CODE_VOID)
 	    {
@@ -805,7 +814,7 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
 	s->type ()->set_is_prototyped (true);
 
       /* Create and enter a new lexical context.  */
-      b = new_block (objfile, FUNCTION_BLOCK, s->language ());
+      b = new_block (objfile, FUNCTION_BLOCK, s->language (), false);
       s->set_value_block (b);
       b->set_function (s);
       b->set_start (sh->value);
@@ -1135,7 +1144,13 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
 	}
 
       top_stack->blocktype = stBlock;
-      b = new_block (objfile, NON_FUNCTION_BLOCK, psymtab_language);
+
+	  /* Using psymtab_langauge fixes commit 76fc0f62138e.
+	     This file does not use buildsym-lecacy.
+	     start_compunit_symtab () is never called.
+	     get_current_subfile () will crash because
+	     buildsym_compunit has never been initialized. */
+      b = new_block (objfile, NON_FUNCTION_BLOCK, psymtab_language, false);
       b->set_start (sh->value + top_stack->procadr);
       b->set_superblock (top_stack->cur_block);
       top_stack->cur_block = b;
@@ -1247,7 +1262,7 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
 	f->set_loc_bitpos (sh->value);
 	bitsize = 0;
 	f->set_type (parse_type (cur_fd, ax, sh->index, &bitsize, bigend,
-				 name));
+				 name, false));
 	f->set_bitsize (bitsize);
       }
       break;
@@ -1269,7 +1284,7 @@ parse_symbol (SYMR *sh, union aux_ext *ax, char *ext_sh, int bigend,
       pend = is_pending_symbol (cur_fdr, ext_sh);
       if (pend == NULL)
 	{
-	  t = parse_type (cur_fd, ax, sh->index, NULL, bigend, name);
+	  t = parse_type (cur_fd, ax, sh->index, NULL, bigend, name, true);
 	  add_pending (cur_fdr, ext_sh, t);
 	}
       else
@@ -1382,7 +1397,7 @@ basic_type (int bt, struct objfile *objfile)
   if (map_bt[bt])
     return map_bt[bt];
 
-  type_allocator alloc (objfile, get_current_subfile ()->language);
+  type_allocator alloc (objfile, psymtab_language);
 
   switch (bt)
     {
@@ -1514,7 +1529,7 @@ basic_type (int bt, struct objfile *objfile)
 
 static struct type *
 parse_type (int fd, union aux_ext *ax, unsigned int aux_index, int *bs,
-	    int bigend, const char *sym_name)
+	    int bigend, const char *sym_name, bool is_stTypedef)
 {
   TIR t[1];
   struct type *tp = 0;
@@ -1571,7 +1586,7 @@ parse_type (int fd, union aux_ext *ax, unsigned int aux_index, int *bs,
 	}
     }
 
-  type_allocator alloc (mdebugread_objfile, get_current_subfile ()->language);
+  type_allocator alloc (mdebugread_objfile, psymtab_language);
 
   /* Move on to next aux.  */
   ax++;
@@ -1628,7 +1643,7 @@ parse_type (int fd, union aux_ext *ax, unsigned int aux_index, int *bs,
       xref_fh = get_rfd (fd, rf);
       xref_fd = xref_fh - debug_info->fdr;
       tp = parse_type (xref_fd, debug_info->external_aux + xref_fh->iauxBase,
-		    rn->index, NULL, xref_fh->fBigendian, sym_name);
+		    rn->index, NULL, xref_fh->fBigendian, sym_name, false);
     }
 
   /* All these types really point to some (common) MIPS type
@@ -1785,6 +1800,13 @@ parse_type (int fd, union aux_ext *ax, unsigned int aux_index, int *bs,
   if (t->continued)
     complaint (_("illegal TIR continued for %s"), sym_name);
 
+  if (is_stTypedef)
+    {
+	struct type *wrap = alloc.new_type (TYPE_CODE_TYPEDEF, 0, sym_name);
+	wrap->set_target_type(tp);
+	tp = wrap;
+    }
+
   return tp;
 }
 
@@ -1839,7 +1861,7 @@ upgrade_type (int fd, struct type **tpp, int tq, union aux_ext *ax, int bigend,
 
       indx = parse_type (fh - debug_info->fdr,
 			 debug_info->external_aux + fh->iauxBase,
-			 id, NULL, bigend, sym_name);
+			 id, NULL, bigend, sym_name, false);
 
       /* The bounds type should be an integer type, but might be anything
 	 else due to corrupt aux entries.  */
@@ -2155,7 +2177,7 @@ parse_external (EXTR *es, int bigend, const section_offsets &section_offsets,
 
 static void
 parse_lines (FDR *fh, PDR *pr, struct linetable *lt, int maxlines,
-	     CORE_ADDR lowest_pdr_addr)
+			   CORE_ADDR textlow, CORE_ADDR lowest_pdr_addr)
 {
   unsigned char *base;
   int j, k;
@@ -2169,7 +2191,6 @@ parse_lines (FDR *fh, PDR *pr, struct linetable *lt, int maxlines,
   for (j = 0; j < fh->cpd; j++, pr++)
     {
       CORE_ADDR l;
-      CORE_ADDR adr;
       unsigned char *halt;
 
       /* No code for this one.  */
@@ -2186,9 +2207,15 @@ parse_lines (FDR *fh, PDR *pr, struct linetable *lt, int maxlines,
 	halt = base + fh->cbLine;
       base += pr->cbLineOffset;
 
-      adr = pr->adr - lowest_pdr_addr;
-
-      l = adr >> 2;		/* in words */
+      /* textlow is the FDR->adr, for the file containing these PDRs.
+	  FDR->adr is the absolute address of the lowest PDR.
+	  PDR->adr's themselves, are relative offsets.
+	  The PDR->adr's may start at 0, or they could have an offset
+	  based on the PDRs position in an object file.
+	  This is why the lowest PDR address is subtracted
+	  from all other PDRs addresses, to subtract out the potential offset.
+	  See bfd/ecofflink.c comments. */
+      l = (textlow +  pr->adr - lowest_pdr_addr) >> 2;		/* in words */
       for (lineno = pr->lnLow; base < halt;)
 	{
 	  count = *base & 0x0f;
@@ -3047,28 +3074,49 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		       index into the namestring which indicates the
 		       debugging type symbol.  */
 
+			int section;
+			bfd_vma address;
+
 		    switch (p[1])
 		      {
 		      case 'S':
+			  section = SECT_OFF_DATA (objfile);
+			  address = sh.value;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 			pst->add_psymbol (gdb::string_view (namestring,
 							    p - namestring),
 					  true, VAR_DOMAIN, LOC_STATIC,
-					  SECT_OFF_DATA (objfile),
+					  section,
 					  psymbol_placement::STATIC,
-					  unrelocated_addr (sh.value),
+					  unrelocated_addr (address),
 					  psymtab_language,
 					  partial_symtabs, objfile);
 			continue;
 		      case 'G':
+			  section = SECT_OFF_DATA (objfile);
+			  address = sh.value;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			    Their sections are relocated in symfile.c default_symfile_offsets
+			    but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 			/* The addresses in these entries are reported
 			   to be wrong.  See the code that reads 'G's
 			   for symtabs.  */
 			pst->add_psymbol (gdb::string_view (namestring,
 							    p - namestring),
 					  true, VAR_DOMAIN, LOC_STATIC,
-					  SECT_OFF_DATA (objfile),
+					  section,
 					  psymbol_placement::GLOBAL,
-					  unrelocated_addr (sh.value),
+					  unrelocated_addr (address),
 					  psymtab_language,
 					  partial_symtabs, objfile);
 			continue;
@@ -3215,12 +3263,21 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 			    function_outside_compilation_unit_complaint
 			      (copy.c_str ());
 			  }
+			section = SECT_OFF_TEXT (objfile);
+			address = sh.value;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 			pst->add_psymbol (gdb::string_view (namestring,
 							    p - namestring),
 					  true, VAR_DOMAIN, LOC_BLOCK,
-					  SECT_OFF_TEXT (objfile),
+					  section,
 					  psymbol_placement::STATIC,
-					  unrelocated_addr (sh.value),
+					  unrelocated_addr (address),
 					  psymtab_language,
 					  partial_symtabs, objfile);
 			continue;
@@ -3236,12 +3293,21 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 			    function_outside_compilation_unit_complaint
 			      (copy.c_str ());
 			  }
+			section = SECT_OFF_TEXT (objfile);
+			address = sh.value;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 			pst->add_psymbol (gdb::string_view (namestring,
 							    p - namestring),
 					  true, VAR_DOMAIN, LOC_BLOCK,
-					  SECT_OFF_TEXT (objfile),
+					  section,
 					  psymbol_placement::GLOBAL,
-					  unrelocated_addr (sh.value),
+					  unrelocated_addr (address),
 					  psymtab_language,
 					  partial_symtabs, objfile);
 			continue;
@@ -3419,6 +3485,9 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		  break;
 		}
 
+		bfd_vma address;
+		/* some symbols don't use the above section */
+		int section_override;
 	      switch (sh.st)
 		{
 		  unrelocated_addr high;
@@ -3426,9 +3495,18 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		  int new_sdx;
 
 		case stStaticProc:
-		  reader.record_with_info (sym_name, minsym_value,
+		    section_override = SECT_OFF_TEXT (objfile);
+			address = (bfd_vma)minsym_value;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section_override].the_bfd_section->vma;
+			}
+		  reader.record_with_info (sym_name, (unrelocated_addr)address,
 					   mst_file_text,
-					   SECT_OFF_TEXT (objfile));
+					   section_override);
 
 		  /* FALLTHROUGH */
 
@@ -3476,12 +3554,21 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		     still able to find the PROGRAM name via the partial
 		     symbol table, and the MAIN__ symbol via the minimal
 		     symbol table.  */
+
+		  address = sh.value;
+		  if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+		  {
+			 /* This is attempting to detect .o files.
+			 Their sections are relocated in symfile.c default_symfile_offsets
+			 but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			 address += objfile->sections_start[section].the_bfd_section->vma;
+		  }
 		  if (sh.st == stProc)
 		    pst->add_psymbol (sym_name, true,
 				      VAR_DOMAIN, LOC_BLOCK,
 				      section,
 				      psymbol_placement::GLOBAL,
-				      unrelocated_addr (sh.value),
+				      unrelocated_addr (address),
 				      psymtab_language,
 				      partial_symtabs, objfile);
 		  else
@@ -3489,7 +3576,7 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 				      VAR_DOMAIN, LOC_BLOCK,
 				      section,
 				      psymbol_placement::STATIC,
-				      unrelocated_addr (sh.value),
+				      unrelocated_addr (address),
 				      psymtab_language,
 				      partial_symtabs, objfile);
 
@@ -3517,13 +3604,36 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 
 		case stStatic:	/* Variable */
 		  if (SC_IS_DATA (sh.sc))
-		    reader.record_with_info (sym_name, minsym_value,
+		  {
+			section_override = SECT_OFF_DATA (objfile);
+			address = 0;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			     address += objfile->sections_start[section_override].the_bfd_section->vma;
+			}
+		    reader.record_with_info (sym_name, (unrelocated_addr)(((bfd_vma)minsym_value + address)),
 					     mst_file_data,
-					     SECT_OFF_DATA (objfile));
+					     section_override);
+		  }
 		  else
-		    reader.record_with_info (sym_name, minsym_value,
+		  {
+			section_override = SECT_OFF_BSS (objfile);
+			address = 0;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section_override].the_bfd_section->vma;
+			}
+		    reader.record_with_info (sym_name, (unrelocated_addr)(((bfd_vma)minsym_value + address)),
 					     mst_file_bss,
-					     SECT_OFF_BSS (objfile));
+					     section_override);
+		  }
+
 		  theclass = LOC_STATIC;
 		  break;
 
@@ -3596,11 +3706,20 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		  cur_sdx++;
 		  continue;
 		}
+			address = sh.value;
+			/* stTypeDef for example will leave section = -1, when loaded from a .o with nothing but type definitions */
+			if (section > -1 && (bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 	      /* Use this gdb symbol.  */
 	      pst->add_psymbol (sym_name, true,
 				VAR_DOMAIN, theclass, section,
 				psymbol_placement::STATIC,
-				unrelocated_addr (sh.value),
+				unrelocated_addr (address),
 				psymtab_language,
 				partial_symtabs, objfile);
 	    skip:
@@ -3676,12 +3795,20 @@ parse_partial_symbols (minimal_symbol_reader &reader,
 		  theclass = LOC_STATIC;
 		  break;
 		}
+		  bfd_vma address = svalue;
 	      char *sym_name = debug_info->ssext + psh->iss;
+			if ((bfd_get_file_flags (objfile->obfd.get ()) & (EXEC_P | DYNAMIC)) == 0)
+			{
+			  /* This is attempting to detect .o files.
+			     Their sections are relocated in symfile.c default_symfile_offsets
+			     but section_offsets are set to 0 there and the offset is put in the vma.	*/
+			  address += objfile->sections_start[section].the_bfd_section->vma;
+			}
 	      pst->add_psymbol (sym_name, true,
 				VAR_DOMAIN, theclass,
 				section,
 				psymbol_placement::GLOBAL,
-				unrelocated_addr (svalue),
+				unrelocated_addr (address),
 				psymtab_language,
 				partial_symtabs, objfile);
 	    }
@@ -4163,7 +4290,7 @@ mdebug_expand_psymtab (legacy_psymtab *pst, struct objfile *objfile)
 		}
 
 	      parse_lines (fh, pr_block.data (), lines, maxlines,
-			   lowest_pdr_addr);
+			   (CORE_ADDR) pst->unrelocated_text_low (), lowest_pdr_addr);
 	      if (lines->nitems < fh->cline)
 		lines = shrink_linetable (lines);
 
@@ -4291,7 +4418,7 @@ cross_ref (int fd, union aux_ext *ax, struct type **tpp,
       rf = rn->rfd;
     }
 
-  type_allocator alloc (mdebugread_objfile, get_current_subfile ()->language);
+  type_allocator alloc (mdebugread_objfile, psymtab_language);
 
   /* mips cc uses a rf of -1 for opaque struct definitions.
      Set TYPE_STUB for these types so that check_typedef will
@@ -4412,7 +4539,8 @@ cross_ref (int fd, union aux_ext *ax, struct type **tpp,
 				 sh.index,
 				 NULL,
 				 fh->fBigendian,
-				 debug_info->ss + fh->issBase + sh.iss);
+				 debug_info->ss + fh->issBase + sh.iss,
+				 sh.st == stTypedef);
 	      add_pending (fh, esh, *tpp);
 	      break;
 
@@ -4438,7 +4566,8 @@ cross_ref (int fd, union aux_ext *ax, struct type **tpp,
 			     sh.index,
 			     NULL,
 			     fh->fBigendian,
-			     debug_info->ss + fh->issBase + sh.iss);
+			     debug_info->ss + fh->issBase + sh.iss,
+			     true);
 	}
       else
 	{
@@ -4542,6 +4671,8 @@ add_line (struct linetable *lt, int lineno, CORE_ADDR adr, int last)
     return lineno;
 
   lt->item[lt->nitems].line = lineno;
+  lt->item[lt->nitems].is_stmt = 1;
+  lt->item[lt->nitems].prologue_end = 1;
   lt->item[lt->nitems++].set_unrelocated_pc (unrelocated_addr (adr << 2));
   return lineno;
 }
@@ -4634,9 +4765,10 @@ new_symtab (const char *name, int maxlines, struct objfile *objfile)
 
   /* All symtabs must have at least two blocks.  */
   bv = new_bvect (2);
-  bv->set_block (GLOBAL_BLOCK, new_block (objfile, NON_FUNCTION_BLOCK, lang));
-  bv->set_block (STATIC_BLOCK, new_block (objfile, NON_FUNCTION_BLOCK, lang));
+  bv->set_block (GLOBAL_BLOCK, new_block (objfile, NON_FUNCTION_BLOCK, lang, true));
+  bv->set_block (STATIC_BLOCK, new_block (objfile, NON_FUNCTION_BLOCK, lang, false));
   bv->static_block ()->set_superblock (bv->global_block ());
+  bv->global_block ()->set_compunit_symtab(cust);
   cust->set_blockvector (bv);
 
   cust->set_debugformat ("ECOFF");
@@ -4723,9 +4855,11 @@ new_bvect (int nblocks)
 
 static struct block *
 new_block (struct objfile *objfile, enum block_type type,
-	   enum language language)
+	   enum language language, bool is_global)
 {
-  struct block *retval = new (&objfile->objfile_obstack) block;
+  struct block *retval = (is_global
+    ? new (&objfile->objfile_obstack) global_block
+    : new (&objfile->objfile_obstack) block);
 
   if (type == FUNCTION_BLOCK)
     retval->set_multidict (mdict_create_linear_expandable (language));
@@ -4754,8 +4888,7 @@ new_type (char *name)
 {
   struct type *t;
 
-  t = type_allocator (mdebugread_objfile,
-		      get_current_subfile ()->language).new_type ();
+  t = type_allocator (mdebugread_objfile, psymtab_language).new_type ();
   t->set_name (name);
   INIT_CPLUS_SPECIFIC (t);
   return t;
